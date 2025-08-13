@@ -1,0 +1,12 @@
+{
+  "name": "Chrome Extension Dev",
+  "build": { "dockerfile": "Dockerfile" },
+  "forwardPorts": [9222],
+  "customizations": {
+    "vscode": {
+      "settings": {
+        "terminal.integrated.shell.linux": "/bin/bash"
+      }
+    }
+  }
+}

@@ -1,0 +1,8 @@
+FROM mcr.microsoft.com/vscode/devcontainers/base:ubuntu
+
+# Install Chromium and tools
+RUN apt-get update && apt-get install -y \
+    chromium-browser \
+    xvfb \
+    --no-install-recommends && \
+    rm -rf /var/lib/apt/lists/*
