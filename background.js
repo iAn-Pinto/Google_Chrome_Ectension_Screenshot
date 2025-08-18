@@ -8,39 +8,43 @@ let lastOptions = {
   addTimestamp: false
 };
 
-chrome.runtime.onMessage.addListener((request) => {
-  if (request.action === 'prepareOptions' && request.options) {
-    lastOptions = { ...lastOptions, ...sanitizeOptions(request.options) };
-  } else if (request.action === 'captureVisible') {
-    lastOptions = { ...lastOptions, ...sanitizeOptions(request.options || {}) };
-    captureVisible(request.tabId, lastOptions).catch(handleError);
-  } else if (request.action === 'captureSelectedArea') {
-    captureSelectedArea(request.rect, lastOptions).catch(handleError);
-  } else if (request.action === 'captureFullPage') {
-    lastOptions = { ...lastOptions, ...sanitizeOptions(request.options || {}) };
-    captureFullPage(request.tabId, lastOptions).catch(handleError);
-  } else if (request.action === 'selectionCanceled') {
-    // no-op, could show a notification
-  }
-});
+if (typeof chrome !== 'undefined' && chrome.runtime && chrome.runtime.onMessage) {
+  chrome.runtime.onMessage.addListener((request) => {
+    if (request.action === 'prepareOptions' && request.options) {
+      lastOptions = { ...lastOptions, ...sanitizeOptions(request.options) };
+    } else if (request.action === 'captureVisible') {
+      lastOptions = { ...lastOptions, ...sanitizeOptions(request.options || {}) };
+      captureVisible(request.tabId, lastOptions).catch(handleError);
+    } else if (request.action === 'captureSelectedArea') {
+      captureSelectedArea(request.rect, lastOptions).catch(handleError);
+    } else if (request.action === 'captureFullPage') {
+      lastOptions = { ...lastOptions, ...sanitizeOptions(request.options || {}) };
+      captureFullPage(request.tabId, lastOptions).catch(handleError);
+    } else if (request.action === 'selectionCanceled') {
+      // no-op, could show a notification
+    }
+  });
+}
 
 // Keyboard shortcut commands
-chrome.commands.onCommand.addListener(async (command) => {
-  try {
-    const [activeTab] = await chrome.tabs.query({ active: true, currentWindow: true });
-    if (!activeTab) return;
-    if (command === 'capture-visible') {
-      captureVisible(activeTab.id, lastOptions).catch(handleError);
-    } else if (command === 'capture-full') {
-      captureFullPage(activeTab.id, lastOptions).catch(handleError);
-    } else if (command === 'capture-selected') {
-      // Inject selection script
-      await chrome.scripting.executeScript({ target: { tabId: activeTab.id }, files: ['content.js'] });
+if (typeof chrome !== 'undefined' && chrome.commands && chrome.commands.onCommand) {
+  chrome.commands.onCommand.addListener(async (command) => {
+    try {
+      const [activeTab] = await chrome.tabs.query({ active: true, currentWindow: true });
+      if (!activeTab) return;
+      if (command === 'capture-visible') {
+        captureVisible(activeTab.id, lastOptions).catch(handleError);
+      } else if (command === 'capture-full') {
+        captureFullPage(activeTab.id, lastOptions).catch(handleError);
+      } else if (command === 'capture-selected') {
+        // Inject selection script
+        await chrome.scripting.executeScript({ target: { tabId: activeTab.id }, files: ['content.js'] });
+      }
+    } catch (e) {
+      handleError(e);
     }
-  } catch (e) {
-    handleError(e);
-  }
-});
+  });
+}
 
 async function captureVisible(tabId, options) {
   const dataUrl = await getVisibleTabDataUrl(tabId, options.format, options.quality);
@@ -236,4 +240,17 @@ function getVisibleTabDataUrl(tabId, format, quality) {
       resolve(url);
     });
   });
+}
+
+// Export pure helpers for unit testing when running in Node (no chrome API).
+// Detection: Node test environment won't have global chrome.
+if (typeof module !== 'undefined' && module.exports) {
+  module.exports = {
+    sanitizeOptions,
+    retry,
+    // expose for tests of filename logic
+    _test: {
+      sampleSanitize: (opts) => sanitizeOptions(opts)
+    }
+  };
 }
