@@ -21,7 +21,7 @@ if (typeof chrome !== 'undefined' && chrome.runtime && chrome.runtime.onMessage)
       lastOptions = { ...lastOptions, ...sanitizeOptions(request.options || {}) };
       captureFullPage(request.tabId, lastOptions).catch(handleError);
     } else if (request.action === 'selectionCanceled') {
-      // no-op, could show a notification
+      // no-op
     }
   });
 }
@@ -37,7 +37,6 @@ if (typeof chrome !== 'undefined' && chrome.commands && chrome.commands.onComman
       } else if (command === 'capture-full') {
         captureFullPage(activeTab.id, lastOptions).catch(handleError);
       } else if (command === 'capture-selected') {
-        // Inject selection script
         await chrome.scripting.executeScript({ target: { tabId: activeTab.id }, files: ['content.js'] });
       }
     } catch (e) {
@@ -67,10 +66,103 @@ async function captureSelectedArea(rect, options) {
   await outputDataUrl(outDataUrl, options);
 }
 
-async function captureFullPage(tabId, options) {
-  // Get page + viewport metrics from the page context
+// Helpers to stabilize the page and align scroll during full-page capture (minimal additions)
+async function preparePageForCapture(tabId) {
+  const [{ result }] = await chrome.scripting.executeScript({
+    target: { tabId },
+    world: 'MAIN',
+    func: () => {
+      const STYLE_ID = '__screenshot_helper_style__';
+      let style = document.getElementById(STYLE_ID);
+      if (style) style.remove();
+      style = document.createElement('style');
+      style.id = STYLE_ID;
+      style.textContent = `
+        html, body { scroll-behavior: auto !important; overscroll-behavior: none !important; }
+        html, body { scroll-snap-type: none !important; }
+        * { animation: none !important; transition: none !important; }
+        ::-webkit-scrollbar { width: 0 !important; height: 0 !important; }
+      `;
+      document.documentElement.appendChild(style);
+
+      const candidates = Array.from(document.body.querySelectorAll('*'));
+      let maxTopFixed = 0;
+      for (const el of candidates) {
+        const cs = getComputedStyle(el);
+        const fixedOrSticky = (cs.position === 'fixed' || cs.position === 'sticky');
+        if (!fixedOrSticky) continue;
+        const r = el.getBoundingClientRect();
+        const visible = r.width > 0 && r.height > 0;
+        const touchesTop = r.top <= 0 && r.bottom > 0;
+        if (visible && (cs.position === 'fixed' || touchesTop)) {
+          maxTopFixed = Math.max(maxTopFixed, Math.ceil(Math.max(0, r.bottom)));
+        }
+      }
+      for (const el of candidates) {
+        const cs = getComputedStyle(el);
+        if (cs.position === 'fixed' || cs.position === 'sticky') {
+          el.setAttribute('data-__screenshot_hidden__', '1');
+          el.style.setProperty('visibility', 'hidden', 'important');
+        }
+      }
+
+      const prevBg = document.documentElement.style.backgroundColor;
+      document.documentElement.setAttribute('data-__screenshot_prev_bg__', prevBg || '');
+      const bodyBg = getComputedStyle(document.body).backgroundColor || '#fff';
+      document.documentElement.style.backgroundColor = bodyBg;
+
+      return { styleId: STYLE_ID, maxTopFixed };
+    }
+  });
+  return result; // { styleId, maxTopFixed }
+}
+
+async function cleanupPageAfterCapture(tabId, styleId) {
+  await chrome.scripting.executeScript({
+    target: { tabId },
+    world: 'MAIN',
+    func: (STYLE_ID) => {
+      document.querySelectorAll('[data-__screenshot_hidden__]').forEach(el => {
+        el.style.removeProperty('visibility');
+        el.removeAttribute('data-__screenshot_hidden__');
+      });
+      const style = document.getElementById(STYLE_ID);
+      if (style) style.remove();
+
+      const prevBg = document.documentElement.getAttribute('data-__screenshot_prev_bg__');
+      if (prevBg !== null) {
+        if (prevBg) {
+          document.documentElement.style.backgroundColor = prevBg;
+        } else {
+          document.documentElement.style.removeProperty('background-color');
+        }
+        document.documentElement.removeAttribute('data-__screenshot_prev_bg__');
+      }
+    },
+    args: [styleId]
+  });
+}
+
+// Align scroll to device pixels, wait for paint to settle (double rAF)
+async function scrollAndWait(tabId, y, scale) {
+  await chrome.scripting.executeScript({
+    target: { tabId },
+    world: 'MAIN',
+    func: (targetY, scale) => {
+      return new Promise(resolve => {
+        const yRounded = Math.round(targetY * scale) / scale;
+        window.scrollTo(0, yRounded);
+        requestAnimationFrame(() => requestAnimationFrame(resolve));
+      });
+    },
+    args: [y, scale]
+  });
+}
+
+async function getPageMetrics(tabId) {
   const [{ result: metrics }] = await chrome.scripting.executeScript({
     target: { tabId },
+    world: 'MAIN',
     func: () => ({
       pageWidth: document.documentElement.scrollWidth,
       pageHeight: document.documentElement.scrollHeight,
@@ -79,70 +171,86 @@ async function captureFullPage(tabId, options) {
       dpr: window.devicePixelRatio
     })
   });
+  return metrics;
+}
 
-  const { pageWidth, pageHeight, viewportHeight, dpr } = metrics;
+// Updated: seam-free full page capture with overlap cropping and cleanup
+async function captureFullPage(tabId, options) {
+  const { pageWidth, pageHeight, viewportHeight, dpr } = await getPageMetrics(tabId);
 
-  // Need windowId for captureVisibleTab
+  const zoom = (await chrome.tabs.getZoom(tabId).catch(() => 1)) || 1;
+  const scale = dpr * zoom;
+
   const tab = await chrome.tabs.get(tabId);
   const windowId = tab.windowId;
 
-  const totalHeightPx = Math.ceil(pageHeight * dpr);
-  const totalWidthPx = Math.ceil(pageWidth * dpr);
+  const { styleId, maxTopFixed } = await preparePageForCapture(tabId);
+  const overlapCss = Math.max(80, (maxTopFixed || 0) + 10);
+  const overlapPx = Math.round(overlapCss * scale);
+  const stepCss = Math.max(1, viewportHeight - overlapCss);
+
+  const totalWidthPx = Math.ceil(pageWidth * scale);
+  const totalHeightPx = Math.ceil(pageHeight * scale);
   const canvas = new OffscreenCanvas(totalWidthPx, totalHeightPx);
   const ctx = canvas.getContext('2d');
 
-  const step = viewportHeight; // logical CSS px step
-  let currentY = 0;
-  let stitchedHeight = 0;
+  let currentY = 0;        // CSS px
+  let stitchedHeight = 0;  // device px
 
   let index = 0;
-  const totalSteps = Math.ceil(pageHeight / step);
+  const totalSteps = Math.ceil(pageHeight / stepCss);
   let progressNotificationId = await createOrUpdateProgress(0, totalSteps);
 
-  while (currentY < pageHeight) {
-    await chrome.scripting.executeScript({
-      target: { tabId },
-      func: (y) => window.scrollTo(0, y),
-      args: [currentY]
-    });
-    // Allow paint – small delay (tunable)
-  await delay(options.retryDelay || 180);
+  try {
+    while (true) {
+      const maxScrollTop = Math.max(0, pageHeight - viewportHeight);
+      const targetY = Math.min(currentY, maxScrollTop);
 
-  const shotDataUrl = await retry(async () => {
-      return await new Promise((resolve, reject) => {
-        chrome.tabs.captureVisibleTab(windowId, { format: 'png' }, (url) => { // PNG for stitching
-          if (chrome.runtime.lastError || !url) return reject(chrome.runtime.lastError || new Error('Empty capture'));
-          resolve(url);
+      await scrollAndWait(tabId, targetY, scale);
+      await delay(options.settleDelay ?? options.retryDelay ?? 160);
+
+      const shotDataUrl = await retry(async () => {
+        return await new Promise((resolve, reject) => {
+          chrome.tabs.captureVisibleTab(windowId, { format: 'png' }, (url) => {
+            if (chrome.runtime.lastError || !url) return reject(chrome.runtime.lastError || new Error('Empty capture'));
+            resolve(url);
+          });
         });
-      });
-  }, options.retryAttempts || 3, options.retryDelay || 180);
+      }, options.retryAttempts || 3, options.retryDelay || 180);
 
-    const bitmap = await dataUrlToImageBitmap(shotDataUrl);
+      const bitmap = await dataUrlToImageBitmap(shotDataUrl);
 
-    // Draw at device-pixel coordinates
-    ctx.drawImage(bitmap, 0, stitchedHeight);
-  stitchedHeight += bitmap.height;
-  currentY += step;
-  index++;
-  progressNotificationId = await createOrUpdateProgress(index, totalSteps, progressNotificationId);
-  // Broadcast progress to any open popup
-  chrome.runtime.sendMessage({ action: 'fullPageProgress', current: index, total: totalSteps });
-  }
+      const remaining = totalHeightPx - stitchedHeight;
+      const srcY = (index === 0) ? 0 : Math.min(overlapPx, Math.max(0, bitmap.height - 1));
+      let srcH = bitmap.height - srcY;
+      if (srcH > remaining) srcH = remaining;
+      if (srcH <= 0) break;
 
-  // If we overshot (due to rounding) we can optionally crop. For simplicity keep as-is.
-  // Crop overshoot if stitchedHeight > required device px height
-  if (stitchedHeight > totalHeightPx) {
-    const cropped = new OffscreenCanvas(totalWidthPx, totalHeightPx);
-    const cctx = cropped.getContext('2d');
-    cctx.drawImage(canvas, 0, 0);
-    const finalDataUrl = await offscreenToDataUrl(cropped, options.format, options.quality);
-    await outputDataUrl(finalDataUrl, options);
-  } else {
+      ctx.drawImage(
+        bitmap,
+        0, srcY, bitmap.width, srcH,
+        0, stitchedHeight, bitmap.width, srcH
+      );
+
+      stitchedHeight += srcH;
+      index++;
+
+      progressNotificationId = await createOrUpdateProgress(index, totalSteps, progressNotificationId);
+      chrome.runtime.sendMessage({ action: 'fullPageProgress', current: index, total: totalSteps });
+
+      if (stitchedHeight >= totalHeightPx) break;
+
+      currentY += stepCss;
+      if (currentY > pageHeight && stitchedHeight >= totalHeightPx - 1) break;
+    }
+
     const finalDataUrl = await offscreenToDataUrl(canvas, options.format, options.quality);
     await outputDataUrl(finalDataUrl, options);
-  }
-  if (progressNotificationId) {
-    chrome.notifications.clear(progressNotificationId);
+  } finally {
+    await cleanupPageAfterCapture(tabId, styleId);
+    if (progressNotificationId) {
+      chrome.notifications.clear(progressNotificationId);
+    }
   }
 }
 
@@ -243,12 +351,10 @@ function getVisibleTabDataUrl(tabId, format, quality) {
 }
 
 // Export pure helpers for unit testing when running in Node (no chrome API).
-// Detection: Node test environment won't have global chrome.
 if (typeof module !== 'undefined' && module.exports) {
   module.exports = {
     sanitizeOptions,
     retry,
-    // expose for tests of filename logic
     _test: {
       sampleSanitize: (opts) => sanitizeOptions(opts)
     }
